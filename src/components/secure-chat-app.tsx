@@ -1,6 +1,19 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+// Override browser autofill styling
+const autofillStyles = `
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  input:-webkit-autofill:active {
+    -webkit-box-shadow: 0 0 0 1000px rgba(0, 0, 0, 0.6) inset !important;
+    -webkit-text-fill-color: #ffffff !important;
+    caret-color: #ffffff !important;
+    transition: background-color 5000s ease-in-out 0s;
+  }
+`;
 import { ApiError, whisperboxClient } from "@/lib/api";
 import { appConfig } from "@/lib/config";
 import {
@@ -838,6 +851,7 @@ export function SecureChatApp() {
   if (!session || !privateKey || !selfPublicKey) {
     return (
       <div className="min-h-full bg-black text-white flex items-center justify-center p-6 relative overflow-hidden">
+          <style>{autofillStyles}</style>  
         <section className="relative w-full max-w-md border border-[#00f3ff]/30 bg-black/40 backdrop-blur-2xl p-8 z-10 transition-all duration-300">
           <div className="mb-8 text-center">
             <h1 className="text-4xl font-bold tracking-wider text-[#00f3ff] uppercase font-mono">ZetroChat</h1>
@@ -932,6 +946,7 @@ export function SecureChatApp() {
 
   return (
     <div className="min-h-full bg-black text-white relative">
+      <style>{autofillStyles}</style>
       <div className="mx-auto flex h-screen w-full max-w-7xl flex-col md:flex-row relative z-10 p-0 md:p-4 gap-0 md:gap-4">
         <aside
           className={`w-full border border-white/10 bg-black/40 backdrop-blur-2xl md:w-96 md:rounded-xl overflow-hidden transition-all duration-300 ${
