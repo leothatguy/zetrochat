@@ -50,3 +50,25 @@ export async function removeKeyEnvelope(userId: string): Promise<void> {
   await withStore("readwrite", (store) => store.delete(`key-envelope:${userId}`));
 }
 
+export type ThreadReadMap = Record<string, string>;
+
+export async function getThreadReadMap(userId: string): Promise<ThreadReadMap> {
+  const result = await withStore("readonly", (store) => store.get(`thread-read:${userId}`));
+  if (!result || typeof result !== "object") {
+    return {};
+  }
+  return result as ThreadReadMap;
+}
+
+export async function setThreadReadAt(
+  userId: string,
+  threadUserId: string,
+  timestampIso: string,
+): Promise<void> {
+  const current = await getThreadReadMap(userId);
+  const next: ThreadReadMap = {
+    ...current,
+    [threadUserId]: timestampIso,
+  };
+  await withStore("readwrite", (store) => store.put(next, `thread-read:${userId}`));
+}

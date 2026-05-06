@@ -10,7 +10,13 @@ import {
   importPublicKey,
   unwrapPrivateKey,
 } from "@/lib/crypto";
-import { getKeyEnvelope, removeKeyEnvelope, saveKeyEnvelope } from "@/lib/storage";
+import {
+  getKeyEnvelope,
+  getThreadReadMap,
+  removeKeyEnvelope,
+  saveKeyEnvelope,
+  setThreadReadAt,
+} from "@/lib/storage";
 import type {
   ConversationSummary,
   DecryptedMessage,
@@ -45,6 +51,13 @@ function formatTimestamp(value: string): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function toMs(timestamp: string | null | undefined): number {
+  if (!timestamp) {
+    return 0;
+  }
+  return new Date(timestamp).getTime();
+}
+
 export function SecureChatApp() {
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [username, setUsername] = useState("");
@@ -65,6 +78,7 @@ export function SecureChatApp() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(false);
   const [selectedUserId, setSelectedUserId] = useState<UUID | null>(null);
+  const [mobileActivePane, setMobileActivePane] = useState<"list" | "chat">("list");
   const [unreadByUser, setUnreadByUser] = useState<Record<string, number>>({});
   const [messagesByUser, setMessagesByUser] = useState<Record<string, DecryptedMessage[]>>({});
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -90,6 +104,13 @@ export function SecureChatApp() {
   const selectedMessages = selectedUserId ? (messagesByUser[selectedUserId] ?? []) : [];
   const composeMessage = selectedUserId ? (composeMessageByUser[selectedUserId] ?? "") : "";
   const newestMessageId = selectedMessages[selectedMessages.length - 1]?.id ?? null;
+  const hasUnreadOutsideSelectedConversation = useMemo(
+    () =>
+      Object.entries(unreadByUser).some(
+        ([userId, count]) => count > 0 && userId !== (selectedUserId ?? ""),
+      ),
+    [selectedUserId, unreadByUser],
+  );
 
   const closeSocket = useCallback(() => {
     manualSocketCloseRef.current = true;
@@ -110,6 +131,7 @@ export function SecureChatApp() {
     setSelfPublicKey(null);
     setConversations([]);
     setSelectedUserId(null);
+    setMobileActivePane("list");
     setUnreadByUser({});
     setMessagesByUser({});
     setSearchResults([]);
@@ -267,6 +289,37 @@ export function SecureChatApp() {
     applyServerConversations(entries);
   }, [applyServerConversations, session, withAuth]);
 
+  const hydrateUnreadCounts = useCallback(
+    async (entries: ConversationSummary[], accessToken: string, currentUserId: UUID) => {
+      const threadReadMap = await getThreadReadMap(currentUserId);
+      const unreadCounts: Record<string, number> = {};
+
+      await Promise.all(
+        entries.map(async (entry) => {
+          const lastReadAt = threadReadMap[entry.user_id];
+          if (entry.last_message_at && toMs(lastReadAt) >= toMs(entry.last_message_at)) {
+            return;
+          }
+
+          const messages = await whisperboxClient.getConversationMessages(entry.user_id, accessToken, {
+            limit: 50,
+          });
+          const unread = messages.filter(
+            (message) =>
+              message.from_user_id !== currentUserId &&
+              (!lastReadAt || toMs(message.created_at) > toMs(lastReadAt)),
+          ).length;
+          if (unread > 0) {
+            unreadCounts[entry.user_id] = unread;
+          }
+        }),
+      );
+
+      setUnreadByUser(unreadCounts);
+    },
+    [],
+  );
+
   const mergeMessages = useCallback((threadUserId: UUID, items: DecryptedMessage[]) => {
     setMessagesByUser((prev) => {
       const existing = prev[threadUserId] ?? [];
@@ -337,7 +390,12 @@ export function SecureChatApp() {
     return () => window.clearTimeout(timeoutId);
   }, [loadConversationMessages, privateKey, selectedUserId, session]);
 
-  const selectConversation = useCallback((userId: UUID) => {
+  const selectConversation = useCallback(
+    (userId: UUID, options?: { openChatOnMobile?: boolean }) => {
+      const shouldOpenChatOnMobile = options?.openChatOnMobile ?? true;
+      if (shouldOpenChatOnMobile) {
+        setMobileActivePane("chat");
+      }
     setErrorText(null);
     setStatusText(null);
     setSelectedUserId(userId);
@@ -350,7 +408,16 @@ export function SecureChatApp() {
         [userId]: 0,
       };
     });
-  }, []);
+      if (session) {
+        const latestKnownMessageTime =
+          messagesByUser[userId]?.[messagesByUser[userId].length - 1]?.createdAt ??
+          conversations.find((conversation) => conversation.user_id === userId)?.last_message_at ??
+          new Date().toISOString();
+        void setThreadReadAt(session.user.id, userId, latestKnownMessageTime);
+      }
+    },
+    [conversations, messagesByUser, session],
+  );
 
   const getRecipientPublicKey = useCallback(
     async (userId: UUID): Promise<CryptoKey> => {
@@ -384,6 +451,8 @@ export function SecureChatApp() {
           ...prev,
           [threadUserId]: (prev[threadUserId] ?? 0) + 1,
         }));
+      } else if (message.from_user_id !== session.user.id && threadUserId === selectedUserId) {
+        void setThreadReadAt(session.user.id, threadUserId, message.created_at);
       }
       setConversations((prev) => {
         const existing = prev.find((conversation) => conversation.user_id === threadUserId);
@@ -592,8 +661,9 @@ export function SecureChatApp() {
       setConversationsLoading(true);
       const entries = await whisperboxClient.getConversations(response.access_token);
       applyServerConversations(entries);
+      setUnreadByUser({});
       if (entries.length > 0) {
-        selectConversation(entries[0].user_id);
+        selectConversation(entries[0].user_id, { openChatOnMobile: false });
         void loadConversationMessages(entries[0].user_id, {
           accessToken: response.access_token,
           privateKey: keyMaterial.privateKey,
@@ -652,8 +722,9 @@ export function SecureChatApp() {
       setConversationsLoading(true);
       const entries = await whisperboxClient.getConversations(response.access_token);
       applyServerConversations(entries);
+      await hydrateUnreadCounts(entries, response.access_token, response.user.id);
       if (entries.length > 0) {
-        selectConversation(entries[0].user_id);
+        selectConversation(entries[0].user_id, { openChatOnMobile: false });
         void loadConversationMessages(entries[0].user_id, {
           accessToken: response.access_token,
           privateKey: unwrappedPrivateKey,
@@ -862,7 +933,11 @@ export function SecureChatApp() {
   return (
     <div className="min-h-full bg-black text-white relative">
       <div className="mx-auto flex h-screen w-full max-w-7xl flex-col md:flex-row relative z-10 p-0 md:p-4 gap-0 md:gap-4">
-        <aside className="w-full border border-white/10 bg-black/40 backdrop-blur-2xl md:w-96 flex flex-col md:rounded-xl overflow-hidden transition-all duration-300">
+        <aside
+          className={`w-full border border-white/10 bg-black/40 backdrop-blur-2xl md:w-96 md:rounded-xl overflow-hidden transition-all duration-300 ${
+            mobileActivePane === "chat" ? "hidden md:flex md:flex-col" : "flex flex-col"
+          }`}
+        >
           <div className="border-b border-white/10 p-5 bg-black/20">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -958,13 +1033,29 @@ export function SecureChatApp() {
           </div>
         </aside>
 
-        <main className="flex flex-1 flex-col border border-white/10 bg-black/40 backdrop-blur-2xl md:rounded-xl overflow-hidden transition-all duration-300">
+        <main
+          className={`flex-1 flex-col border border-white/10 bg-black/40 backdrop-blur-2xl md:rounded-xl overflow-hidden transition-all duration-300 ${
+            mobileActivePane === "list" ? "hidden md:flex" : "flex"
+          }`}
+        >
           <header className="border-b border-white/10 px-6 py-5 bg-black/20 flex items-center justify-between">
-            <div>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setMobileActivePane("list")}
+                className="relative border border-white/20 bg-black/50 px-3 py-2 text-xs font-medium text-white hover:bg-white/10 hover:text-[#00f3ff] transition-colors duration-300 font-mono md:hidden"
+              >
+                BACK
+                {hasUnreadOutsideSelectedConversation ? (
+                  <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full bg-[#00f3ff]" />
+                ) : null}
+              </button>
+              <div>
               <h3 className="text-lg font-bold tracking-wider text-[#00f3ff] font-mono">
                 {selectedConversation ? selectedConversation.display_name : "NO SIGNAL"}
               </h3>
               <p className="text-[10px] text-white/50 uppercase tracking-widest mt-1 font-mono">Secure transmission node</p>
+              </div>
             </div>
             {selectedConversation && (
               <div className="h-2 w-2 bg-[#00f3ff] animate-pulse"></div>
